@@ -631,3 +631,149 @@ async fn service_availability_excludes_disabled_upstreams() {
 
     pool.close().await;
 }
+
+/// 渠道清理(Task 渠道清理):按渠道维度组合执行 清日志/清统计/重置失败计数。
+/// 验证:dry_run 只预览不删;clear_logs 只删日志不动统计;reset_fail 只清 fail_count
+/// 不动请求/成功/token;clear_stats 只删统计不动日志。
+#[tokio::test]
+async fn cleanup_channel_combines_logs_stats_and_fail_reset() {
+    use waliapi_lib::commands::log::CleanupChannelInput;
+
+    let pool = fresh_db().await;
+    let repo = Repository::new(pool.clone());
+
+    let t1 = "2026-09-01T08:15:00.000Z";
+    let t2 = "2026-09-02T08:15:00.000Z";
+    // 渠道 c1:两条日志(一成一败);渠道 c2:一条日志。
+    repo.create_log(&log(
+        "a",
+        Some("k1"),
+        Some("c1"),
+        "m1",
+        200,
+        100,
+        20,
+        120,
+        50,
+        t1,
+    ))
+    .await
+    .unwrap();
+    repo.create_log(&log(
+        "b",
+        Some("k1"),
+        Some("c1"),
+        "m1",
+        500,
+        10,
+        0,
+        10,
+        5,
+        t2,
+    ))
+    .await
+    .unwrap();
+    repo.create_log(&log("c", Some("k2"), Some("c2"), "m2", 200, 1, 1, 2, 3, t2))
+        .await
+        .unwrap();
+
+    // dry_run:只预览,不执行任何删除。
+    let (logs, stats, fail) = repo
+        .cleanup_channel(
+            &CleanupChannelInput {
+                channel_id: "c1".into(),
+                clear_logs: Some(true),
+                clear_stats: Some(true),
+                reset_fail: Some(true),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(logs, 2, "c1 两条日志应被预览");
+    assert_eq!(stats, 2, "c1 两个小时桶统计行应被预览");
+    assert_eq!(fail, 1, "c1 仅 500 那条所在桶 fail_count>0");
+    let logs_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(logs_left, 3, "dry_run 不得删除");
+
+    // 只清日志:日志变 1(c1 两条删掉),统计不动(仍 3 行)。
+    let (logs, stats, _) = repo
+        .cleanup_channel(
+            &CleanupChannelInput {
+                channel_id: "c1".into(),
+                clear_logs: Some(true),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(logs, 2);
+    assert_eq!(stats, 0, "未勾选清统计则不动统计");
+    let logs_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(logs_left, 1, "只剩 c2 一条日志");
+    let stats_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_stats")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stats_left, 3, "统计不受日志清理影响");
+
+    // 重置失败计数:仅把 c1 的 fail_count 清零;请求/成功/token 不动。
+    let (_, _, reset) = repo
+        .cleanup_channel(
+            &CleanupChannelInput {
+                channel_id: "c1".into(),
+                reset_fail: Some(true),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset, 1, "c1 一个 fail_count>0 行被清零");
+    let (req, suc, fail_count): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(request_count),0), COALESCE(SUM(success_count),0), \
+         COALESCE(SUM(fail_count),0) FROM usage_stats WHERE channel_id = 'c1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (req, suc, fail_count),
+        (2, 1, 0),
+        "仅 fail_count 清零,请求/成功不动"
+    );
+
+    // 清统计:删除 c1 统计行(2 行),日志不受影响(仍 1 条)。
+    let (_, stats_del, _) = repo
+        .cleanup_channel(
+            &CleanupChannelInput {
+                channel_id: "c1".into(),
+                clear_stats: Some(true),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats_del, 2);
+    let stats_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_stats")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stats_left, 1, "只剩 c2 统计行");
+    let logs_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(logs_left, 1, "清统计不动日志");
+
+    pool.close().await;
+}
