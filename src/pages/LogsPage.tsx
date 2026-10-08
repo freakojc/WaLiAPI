@@ -1995,10 +1995,11 @@ function CleanLogsModal({
 }) {
   const [tab, setTab] = useState<"logs" | "channel">("logs");
 
-  // 切到「渠道清理」时拉取渠道清单(幂等:已加载则不重复请求)。
+  // 渠道下拉两个 tab 都用(全局日志的目标渠道 / 渠道日志的渠道选择),
+  // 弹窗一挂载即拉取;channels 非空则跳过,避免重复请求。
   useEffect(() => {
-    if (tab === "channel" && channels.length === 0) onLoadChannels();
-  }, [tab, channels.length, onLoadChannels]);
+    if (channels.length === 0) onLoadChannels();
+  }, [channels.length, onLoadChannels]);
 
   const inputCls = "w-full px-3 py-2 text-sm rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 bg-white";
   const tabCls = (active: boolean) =>
