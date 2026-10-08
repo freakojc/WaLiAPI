@@ -2010,14 +2010,14 @@ function CleanLogsModal({
         <h3 className="text-lg font-semibold mb-1">清理</h3>
         <p className="text-sm text-muted-foreground mb-4">下一步将显示预计影响并二次确认。</p>
 
-        {/* 双 tab:清理日志(全局维度)/ 渠道清理(按渠道维度) */}
+        {/* 双 tab:全局日志(全局维度)/ 渠道日志(按渠道维度) */}
         <div className="mb-4 flex rounded-lg border border-slate-200 bg-slate-50 p-0.5">
-          <button className={tabCls(tab === "logs")} onClick={() => setTab("logs")}>清理日志</button>
-          <button className={tabCls(tab === "channel")} onClick={() => setTab("channel")}>渠道清理</button>
+          <button className={tabCls(tab === "logs")} onClick={() => setTab("logs")}>全局日志</button>
+          <button className={tabCls(tab === "channel")} onClick={() => setTab("channel")}>渠道日志</button>
         </div>
 
         {tab === "logs" ? (
-          <CleanLogsForm inputCls={inputCls} onConfirm={onConfirmLogs} />
+          <CleanLogsForm inputCls={inputCls} channels={channels} onConfirm={onConfirmLogs} />
         ) : (
           <CleanChannelForm inputCls={inputCls} channels={channels} onConfirm={onConfirmChannel} />
         )}
@@ -2030,19 +2030,19 @@ function CleanLogsModal({
   );
 }
 
-// 清理日志表单(全局维度:时间 + 状态 + 渠道/Key/模型,多条件组合)。
+// 全局日志表单(全局维度:时间 + 请求结果 + 可选目标渠道)。
 function CleanLogsForm({
   inputCls,
+  channels,
   onConfirm,
 }: {
   inputCls: string;
+  channels: Channel[];
   onConfirm: (input: DeleteLogsInput) => void;
 }) {
   const [retention, setRetention] = useState("30"); // 保留最近 N 天,空=全部
   const [isSuccess, setIsSuccess] = useState("");
-  const [channelId, setChannelId] = useState("");
-  const [apiKeyId, setApiKeyId] = useState("");
-  const [model, setModel] = useState("");
+  const [channelId, setChannelId] = useState(""); // 空=全部渠道
   const [clearStats, setClearStats] = useState(false);
 
   const submit = () => {
@@ -2050,8 +2050,6 @@ function CleanLogsForm({
       keep_recent_days: retention ? Number(retention) : undefined,
       is_success: isSuccess ? isSuccess === "success" : undefined,
       channel_id: channelId || undefined,
-      api_key_id: apiKeyId || undefined,
-      model: model || undefined,
       clear_stats: clearStats || undefined,
     };
     onConfirm(input);
@@ -2077,19 +2075,14 @@ function CleanLogsForm({
           <option value="failed">仅失败（非 2xx）</option>
         </select>
       </div>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <div>
-          <label className="mb-1 block text-xs font-medium text-slate-600">渠道 ID（可选）</label>
-          <input type="text" value={channelId} onChange={e => setChannelId(e.target.value)} placeholder="留空=全部" className={inputCls} />
-        </div>
-        <div>
-          <label className="mb-1 block text-xs font-medium text-slate-600">Key ID（可选）</label>
-          <input type="text" value={apiKeyId} onChange={e => setApiKeyId(e.target.value)} placeholder="留空=全部" className={inputCls} />
-        </div>
-        <div>
-          <label className="mb-1 block text-xs font-medium text-slate-600">模型（可选）</label>
-          <input type="text" value={model} onChange={e => setModel(e.target.value)} placeholder="留空=全部" className={inputCls} />
-        </div>
+      <div>
+        <label className="mb-1 block text-xs font-medium text-slate-600">目标渠道（可选）</label>
+        <select value={channelId} onChange={e => setChannelId(e.target.value)} className={inputCls}>
+          <option value="">全部渠道</option>
+          {channels.map(ch => (
+            <option key={ch.id} value={ch.id}>{ch.name}（{ch.id}）</option>
+          ))}
+        </select>
       </div>
       <label className="flex items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 cursor-pointer">
         <input type="checkbox" checked={clearStats} onChange={e => setClearStats(e.target.checked)} className="mt-0.5" />
