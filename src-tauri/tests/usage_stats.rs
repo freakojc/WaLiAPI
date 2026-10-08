@@ -751,6 +751,19 @@ async fn cleanup_channel_combines_logs_stats_and_fail_reset() {
         "仅 fail_count 清零,请求/成功不动"
     );
 
+    // 修复回归:reset_fail 后首页模型分布(m1)成功率应恢复 100%,
+    // 口径 success/(success+failed),而非停滞在 50%。
+    let model_stats = repo.get_model_stats().await.unwrap();
+    let m1 = model_stats
+        .iter()
+        .find(|s| s.model == "m1")
+        .expect("m1 应在模型统计中");
+    assert!(
+        (m1.success_rate - 1.0).abs() < 1e-4,
+        "reset_fail 后 m1 成功率应恢复 100%,实际 {}",
+        m1.success_rate
+    );
+
     // 清统计:删除 c1 统计行(2 行),日志不受影响(仍 1 条)。
     let (_, stats_del, _) = repo
         .cleanup_channel(
@@ -774,6 +787,65 @@ async fn cleanup_channel_combines_logs_stats_and_fail_reset() {
         .await
         .unwrap();
     assert_eq!(logs_left, 1, "清统计不动日志");
+
+    pool.close().await;
+}
+
+/// 部分渠道清理后,模型成功率按剩余渠道的真实数据计算:
+/// m1 同时在 c1(1成功1失败)与 c2(1成功1失败)出现,reset_fail 只清 c1,
+/// c2 的失败计数保留 → 清后聚合 success=2、failed=1 → 2/3,而非 100%。
+/// 这保证清理个别渠道不会"抹掉"其他渠道的真实失败。
+#[tokio::test]
+async fn model_success_rate_reflects_remaining_channels_after_partial_reset() {
+    use waliapi_lib::commands::log::CleanupChannelInput;
+
+    let pool = fresh_db().await;
+    let repo = Repository::new(pool.clone());
+
+    let t = "2026-09-04T08:15:00.000Z";
+    // 同一模型 m1 走两个渠道:c1 1成功1失败,c2 1成功1失败。
+    repo.create_log(&log("a", Some("k1"), Some("c1"), "m1", 200, 10, 1, 11, 5, t))
+        .await
+        .unwrap();
+    repo.create_log(&log("b", Some("k1"), Some("c1"), "m1", 500, 0, 0, 0, 1, t))
+        .await
+        .unwrap();
+    repo.create_log(&log("c", Some("k2"), Some("c2"), "m1", 200, 5, 1, 6, 2, t))
+        .await
+        .unwrap();
+    repo.create_log(&log("d", Some("k2"), Some("c2"), "m1", 500, 0, 0, 0, 1, t))
+        .await
+        .unwrap();
+
+    // 基线:m1 成功率 = 2/4 = 0.5。
+    let before = repo.get_model_stats().await.unwrap();
+    let m1 = before.iter().find(|s| s.model == "m1").unwrap();
+    assert!(
+        (m1.success_rate - 0.5).abs() < 1e-4,
+        "基线成功率应为 0.5,实际 {}",
+        m1.success_rate
+    );
+
+    // 只清 c1 的失败计数(c2 保留)。
+    repo.cleanup_channel(
+        &CleanupChannelInput {
+            channel_id: "c1".into(),
+            reset_fail: Some(true),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+
+    // 清后:success=2(两渠道),failed=1(仅 c2 那条)→ 2/3,不是 100%。
+    let after = repo.get_model_stats().await.unwrap();
+    let m1 = after.iter().find(|s| s.model == "m1").unwrap();
+    assert!(
+        (m1.success_rate - 2.0 / 3.0).abs() < 1e-4,
+        "清理 c1 后 c2 失败仍在,成功率应为 2/3,实际 {}",
+        m1.success_rate
+    );
 
     pool.close().await;
 }
