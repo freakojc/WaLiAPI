@@ -316,6 +316,7 @@ pub fn run() {
             commands::api_key::test_api_key_knowledge_access,
             commands::api_key::test_api_key_knowledge_health,
             commands::api_key::get_api_key_full,
+            commands::api_key::get_api_key_answer_models,
             commands::api_key::create_api_key,
             commands::api_key::update_api_key,
             commands::api_key::delete_api_key,

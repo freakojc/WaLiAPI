@@ -525,6 +525,9 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         "get_api_key_full" => {
             to_json(commands::api_key::get_api_key_full(state, arg(&args, "id")?).await)
         }
+        "get_api_key_answer_models" => {
+            to_json(commands::api_key::get_api_key_answer_models(state, arg(&args, "id")?).await)
+        }
         "create_api_key" => {
             to_json(commands::api_key::create_api_key(arg(&args, "input")?, state).await)
         }
