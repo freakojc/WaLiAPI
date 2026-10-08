@@ -559,3 +559,75 @@ async fn backfill_is_idempotent_and_matches_logs() {
 
     pool.close().await;
 }
+
+/// 服务可用率健康口径(渠道健康度设计 v2):
+/// - 分母 = 启用渠道(status=1);分子 = 启用且健康(COALESCE(last_probe_ok,1)=1)
+/// - 主动禁用的渠道不计入分子分母,不拉低可用率;
+/// - 只有真实探测失败(last_probe_ok=0)才让可用率下降;
+/// - 账号侧分母=未禁用,分子=未禁用且凭证 active。
+#[tokio::test]
+async fn service_availability_excludes_disabled_upstreams() {
+    let pool = fresh_db().await;
+    let repo = Repository::new(pool.clone());
+    let now = models::now_iso();
+
+    async fn ins_channel(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        status: i64,
+        last_probe_ok: Option<i64>,
+    ) {
+        let now = models::now_iso();
+        let lpk = last_probe_ok.map(|v| v.to_string());
+        sqlx::query(
+            "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, \
+             weight, config, model_mapping, timeout_secs, identity_revision, created_at, updated_at, \
+             last_probe_ok) \
+             VALUES (?, ?, 'openai', 'http://127.0.0.1:1', 'sk-x', '[]', ?, 1, 1, '{}', '{}', 60, 0, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(status)
+        .bind(&now)
+        .bind(&now)
+        .bind(lpk)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // 场景:两个启用渠道(一个健康、一个探测失败)+ 一个禁用渠道。
+    ins_channel(&pool, "c-healthy", 1, Some(1)).await;
+    ins_channel(&pool, "c-down", 1, Some(0)).await;
+    ins_channel(&pool, "c-disabled", 0, Some(1)).await;
+
+    // 一个启用账号、一个禁用账号。
+    sqlx::query(
+        "INSERT INTO auth_accounts (id, provider, label, account_id, disabled, status, payload_json, created_at, updated_at) \
+         VALUES ('a-active', 'openai', 'a', 'act', 0, 'active', '{}', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auth_accounts (id, provider, label, account_id, disabled, status, payload_json, created_at, updated_at) \
+         VALUES ('a-disabled', 'openai', 'a', 'act2', 1, 'active', '{}', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let dash = repo.get_dashboard_stats().await.unwrap();
+    // 渠道:分母=2 个启用渠道;分子=仅健康渠道 1 个(c-down 探测失败、c-disabled 禁用都不计)。
+    assert_eq!(dash.total_channels, 2, "禁用渠道不进分母");
+    assert_eq!(dash.active_channels, 1, "探测失败渠道不计入分子");
+    // 账号:分母=未禁用的 1 个;分子=未禁用且 active 的 1 个。
+    assert_eq!(dash.total_auth_accounts, 1, "禁用账号不进分母");
+    assert_eq!(dash.active_auth_accounts, 1);
+
+    pool.close().await;
+}

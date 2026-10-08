@@ -2531,19 +2531,26 @@ impl Repository {
             }
         };
 
-        let active_channels: i64 =
+        // 服务可用率的健康口径（渠道健康度设计 v2）：
+        // - 分母 = 启用渠道（status=1）；主动禁用的渠道不计入，避免"用户下线"拉低可用率
+        // - 分子 = 启用且健康：last_probe_ok=1（探测通过）或 NULL（从未探测视为可用）
+        //   只有真实探测失败（last_probe_ok=0）才会拉低可用率，如实反映上游故障。
+        // 渠道健康探测循环见 health_probe.rs（默认 300s 一轮，仅探测启用渠道）。
+        let active_channels: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM channels WHERE status = 1 AND COALESCE(last_probe_ok, 1) = 1",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        let total_channels: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM channels WHERE status = 1")
                 .fetch_one(&self.pool)
                 .await
                 .unwrap_or(0);
 
-        let total_channels: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels")
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-
-        // Auth 账号同样承担上游能力，可用率统计必须纳入：
-        // 可用 = 未禁用且凭证状态有效。
+        // Auth 账号无网络可达性探测（仅 12h token 刷新 + quota 探测），
+        // 可用口径 = 未禁用且凭证有效；分母 = 未禁用账号（主动禁用的不计入）。
         let active_auth_accounts: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM auth_accounts WHERE disabled = 0 AND status = 'active'",
         )
@@ -2551,10 +2558,11 @@ impl Repository {
         .await
         .unwrap_or(0);
 
-        let total_auth_accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_accounts")
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
+        let total_auth_accounts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM auth_accounts WHERE disabled = 0")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
 
         let total_api_keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys")
             .fetch_one(&self.pool)
