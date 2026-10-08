@@ -2663,7 +2663,11 @@ impl Repository {
                 COALESCE(SUM(completion_tokens), 0) as output_tokens,
                 COALESCE(SUM(cached_tokens), 0) as cached_tokens,
                 COALESCE(SUM(total_tokens), 0) as total_tokens,
-                ROUND(CAST(COALESCE(SUM(success_count), 0) AS REAL) / NULLIF(SUM(request_count), 0), 4) as success_rate,
+                -- 口径与渠道/Key 统计一致:success/(success+failed)。
+                -- 常规数据下 request_count = success+fail,两口径数值相等;
+                -- 渠道清理的 reset_fail(仅清 fail_count、不动 request_count)后,
+                -- 此口径会使模型成功率随之恢复到 ~100%,而非停滞在旧值。
+                ROUND(CAST(COALESCE(SUM(success_count), 0) AS REAL) / NULLIF(SUM(success_count) + SUM(fail_count), 0), 4) as success_rate,
                 CAST(COALESCE(SUM(total_duration_ms), 0) AS REAL) / NULLIF(SUM(request_count), 0) as avg_latency_ms
             FROM usage_stats
             GROUP BY model
