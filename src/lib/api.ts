@@ -88,6 +88,7 @@ export interface KnowledgeHealthTest {
 }
 
 export const apiKeyApi = {
+  getAnswerModels: (id: string) => invoke<string[]>("get_api_key_answer_models", { id }),
   getKnowledgeAccess: (id: string) => invoke<string[]>("get_api_key_knowledge_access", { id }),
   setKnowledgeAccess: (id: string, kbIds: string[]) => invoke<void>("set_api_key_knowledge_access", { id, kbIds }),
   testKnowledgeAccess: (id: string, kbId: string) => invoke<{ rest_status: number; rest_ok: boolean; mcp_status: number; mcp_ok: boolean }>("test_api_key_knowledge_access", { id, kbId }),
