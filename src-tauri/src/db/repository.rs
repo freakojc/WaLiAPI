@@ -1,6 +1,15 @@
 use super::models::*;
 use sqlx::{Row, SqlitePool};
 
+// 稳态真实请求只补健康时间戳；主动探测和失败后的恢复不受此间隔限制。
+const PASSIVE_PROBE_REFRESH_SECS: u64 = 30;
+const PASSIVE_PROBE_NEEDS_REFRESH: &str =
+    "COALESCE(last_probe_ok, 0) != 1 OR julianday(last_probe_at) IS NULL \
+     OR julianday(last_probe_at) <= julianday('now', ?1) \
+     OR julianday(last_probe_at) > julianday('now')";
+const CHANNEL_MODE_IS_HEALTHY: &str = "consecutive_failures = 0 AND cooldown_until IS NULL \
+     AND last_failure_at IS NULL AND last_failure_reason IS NULL";
+
 /// Parse the stored JSON endpoint list back into a Vec, or None when empty/absent.
 fn parse_eps(raw: &Option<String>) -> Option<Vec<String>> {
     let s = raw.as_deref()?;
@@ -195,20 +204,45 @@ impl Repository {
         Ok(result.rows_affected())
     }
 
-    /// 被动反哺：真实请求成功后立即恢复该渠道的探测健康标记
-    /// （与 mode_health 的成功清除相互独立、各管各的表）。
+    /// 被动反哺：失败或未知状态在真实请求成功后立即恢复。
+    /// 持续成功时，健康时间戳至多每 30 秒刷新一次；表示最近落库的健康证据，
+    /// 不再表示每次请求时间。主动探测仍每轮写入，探测延迟保持原值。
+    /// 数据库状态决定是否刷新，不依赖进程缓存，重启和并发调用共用同一条件。
+    /// 与 mode_health 的成功清除相互独立、各管各的表。
     pub async fn mark_probe_ok(&self, channel_id: &str) {
-        let result = sqlx::query(
-            "UPDATE channels SET last_probe_ok = 1, last_probe_at = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(crate::db::models::now_iso())
-        .bind(crate::db::models::now_iso())
-        .bind(channel_id)
-        .execute(&self.pool)
-        .await;
-        if let Err(error) = result {
+        if let Err(error) = self.mark_probe_ok_if_needed(channel_id).await {
             tracing::warn!("[探测] 被动反哺失败（channel {channel_id}）: {error}");
         }
+    }
+
+    async fn mark_probe_ok_if_needed(&self, channel_id: &str) -> Result<u64, sqlx::Error> {
+        let refresh_modifier = format!("-{PASSIVE_PROBE_REFRESH_SECS} seconds");
+        // 先读持久状态，稳态请求不提交 UPDATE，避免 no-op UPDATE 也争夺写锁。
+        // 无法解析/未来的时间戳也刷新，避免旧数据或时钟回拨造成无限跳过。
+        let needs_refresh = sqlx::query_scalar::<_, bool>(&format!(
+            "SELECT ({PASSIVE_PROBE_NEEDS_REFRESH}) FROM channels WHERE id = ?2"
+        ))
+        .bind(&refresh_modifier)
+        .bind(channel_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if !needs_refresh.unwrap_or(false) {
+            return Ok(0);
+        }
+
+        // 多个读取同时发现需要刷新时，由同一个 SQL 条件合并为一次实际写入。
+        // 时间取 SQL 执行时刻，排队的成功请求不会用较旧时间覆盖较新健康证据。
+        let result = sqlx::query(&format!(
+            "UPDATE channels SET last_probe_ok = 1, \
+             last_probe_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?2 AND ({PASSIVE_PROBE_NEEDS_REFRESH})"
+        ))
+        .bind(&refresh_modifier)
+        .bind(channel_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Return channels that are enabled and not cooling down for this exact
@@ -239,15 +273,29 @@ impl Repository {
         .await
     }
 
-    /// Clear a mode-specific cooldown after that mode successfully serves a
-    /// request. The row is retained as a lightweight recovery audit record.
+    /// 成功后清除对应端点、流式模式的故障状态，保留轻量恢复记录。
+    /// 全健康行先读后跳过写入；缺行首次插入，故障立即恢复，不使用请求间缓存。
     pub async fn record_channel_mode_success(
         &self,
         channel_id: &str,
         endpoint: &str,
         is_stream: bool,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        let healthy = sqlx::query_scalar::<_, bool>(&format!(
+            "SELECT ({CHANNEL_MODE_IS_HEALTHY}) FROM channel_mode_health \
+             WHERE channel_id = ? AND endpoint = ? AND is_stream = ?"
+        ))
+        .bind(channel_id)
+        .bind(endpoint)
+        .bind(i64::from(is_stream))
+        .fetch_optional(&self.pool)
+        .await?;
+        if healthy == Some(true) {
+            return Ok(());
+        }
+
+        // 并发读取缺行或故障后，仅第一条成功真正插入/恢复该行。
+        sqlx::query(&format!(
             "INSERT INTO channel_mode_health
                 (channel_id, endpoint, is_stream, consecutive_failures, cooldown_until, last_failure_at, last_failure_reason)
              VALUES (?, ?, ?, 0, NULL, NULL, NULL)
@@ -255,8 +303,9 @@ impl Repository {
                 consecutive_failures = 0,
                 cooldown_until = NULL,
                 last_failure_at = NULL,
-                last_failure_reason = NULL",
-        )
+                last_failure_reason = NULL
+             WHERE NOT ({CHANNEL_MODE_IS_HEALTHY})"
+        ))
         .bind(channel_id)
         .bind(endpoint)
         .bind(i64::from(is_stream))
@@ -2382,3 +2431,7 @@ impl Repository {
             .await
     }
 }
+
+#[cfg(test)]
+#[path = "probe_success_tests.rs"]
+mod probe_success_tests;
