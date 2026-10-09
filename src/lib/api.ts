@@ -331,6 +331,20 @@ export interface KnowledgeBase {
     updated_at: string;
 }
 
+/** doc_meta.pdf_text_extraction：只记录文字层质量，不含原文，不代表内容完整性。 */
+export interface PdfTextExtraction {
+  version: 1;
+  page_count: number;
+  status: "complete" | "partial" | "failed";
+  pages: {
+    page_no: number;
+    char_count: number;
+    status: "extracted" | "insufficient" | "failed";
+    error_code?: string;
+  }[];
+  error_code?: string;
+}
+
 export interface KbDocument {
   id: string;
   kb_id: string;
@@ -348,6 +362,7 @@ export interface KbDocument {
   source_path: string | null;
   doc_meta: string;
   ocr_engine: string | null;
+  /** PDF 页面树中的页数；未记录或无法读取页面树时为 0。 */
   page_count: number;
   /** JSON 数组字符串，如 "[3,7]"，前端自行 JSON.parse */
   ocr_failed_pages: string;
