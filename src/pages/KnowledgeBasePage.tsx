@@ -30,6 +30,7 @@ import {
   type WikiTag,
   type WikiExportResult,
   type WikiImportResult,
+  type WikiIndexRebuildResult,
   type ServiceStatus,
 } from "../lib/api";
 import type { Channel, ApiKey } from "../types";
@@ -86,6 +87,7 @@ Play,
   Download,
   FileArchive,
   FolderSearch,
+  ListTree,
 } from "lucide-react";
 
 import { PromptTemplatesSection } from "../components/PromptTemplatesSection";
@@ -4887,6 +4889,52 @@ function WikiPagesTab({ project }: { project: WikiProject }) {
   );
 }
 
+// ─── 目录重建二次确认弹窗（程序 / LLM；锁定页面滚动）─────────────────────
+function RebuildIndexConfirmDialog({ mode, onClose, onConfirm }: { mode: "program" | "llm"; onClose: () => void; onConfirm: () => void }) {
+  // 弹窗期间锁定页面滚动（关闭时恢复）
+  useEffect(() => {
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = ""; };
+  }, []);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="relative w-full max-w-md rounded-3xl bg-white p-7 shadow-2xl" onClick={e => e.stopPropagation()}>
+        <button onClick={onClose} className="absolute right-5 top-5 rounded-full p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600">
+          <XCircle className="h-5 w-5" />
+        </button>
+        <div className="flex items-center gap-2">
+          <div className="rounded-2xl border border-violet-100 bg-violet-50 p-2.5">
+            <RefreshCw className="h-5 w-5 text-violet-600" />
+          </div>
+          <h2 className="text-lg font-semibold text-slate-900">重建 Wiki 目录</h2>
+        </div>
+        <div className="mt-4 space-y-2 text-xs text-slate-600">
+          {mode === "program" ? (
+            <>
+              <p>• 按页面类型（实体/概念/摘要/评审）重新生成 wiki/index.md，覆盖旧目录。</p>
+              <p>• 零 LLM 消耗、毫秒级完成；log.md 缺失时自动从源资料回溯修复。</p>
+            </>
+          ) : (
+            <>
+              <p>• 将调用一次 LLM，对全部页面做语义归组后重写 wiki/index.md（覆盖旧目录）。</p>
+              <p>• 会消耗 token（使用项目问答/摄入模型与渠道）。</p>
+              <p>• LLM 漏掉的页面会自动补到《未分组》，不会丢失任何页面；失败则自动回退为程序化重建。</p>
+            </>
+          )}
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button onClick={onClose} className="action-secondary">取消</button>
+          <button onClick={onConfirm} className="action-primary">
+            <RefreshCw className="h-4 w-4" />
+            确认重建
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function WikiSourcesTab({ project, onRefresh, onNavigateSettings, progressMap, sourcesVersion }: { project: WikiProject; onRefresh: () => void; onNavigateSettings: () => void; progressMap: Record<string, { stage: string; progress: number; detail: string; filename: string }>; sourcesVersion: number }) {
   const [sources, setSources] = useState<WikiSource[]>([]);
   const [loading, setLoading] = useState(true);
@@ -4895,6 +4943,12 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings, progressMap, s
   const [uploadTotal, setUploadTotal] = useState(0);
   const [uploadingCount, setUploadingCount] = useState(0);
   const [sourceFileDeleteTarget, setSourceFileDeleteTarget] = useState<{ message: string; run: () => void } | null>(null);
+  // ── 目录重建（程序 / LLM）──
+  const [rebuildMode, setRebuildMode] = useState<"program" | "llm">("program");
+  const [rebuildConfirm, setRebuildConfirm] = useState(false);
+  const [rebuildBusy, setRebuildBusy] = useState(false);
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
+  const [rebuildDone, setRebuildDone] = useState<WikiIndexRebuildResult | null>(null);
 
   const fetchSources = useCallback(async () => {
     setLoading(true);
@@ -5094,6 +5148,64 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings, progressMap, s
             </div>
           </div>
         </div>
+      )}
+
+      {/* 目录重建工具栏（程序化分组 / LLM 语义归组；log 缺失时一并回溯修复） */}
+      <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-100 bg-slate-50/70 px-4 py-3">
+        <div className="flex items-center gap-2">
+          <ListTree className="h-4 w-4 text-slate-400" />
+          <span className="text-xs font-medium text-slate-700">重建目录</span>
+        </div>
+        <select
+          value={rebuildMode}
+          onChange={(e) => { setRebuildMode(e.target.value as "program" | "llm"); setRebuildDone(null); setRebuildError(null); }}
+          className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-700"
+        >
+          <option value="program">程序化（按类型分组，零消耗）</option>
+          <option value="llm">LLM 智能归组（消耗 token）</option>
+        </select>
+        {rebuildMode === "llm" && (
+          <span className="text-[11px] text-amber-600">⚠ 将调用一次 LLM 对全部页面做语义归组，会消耗 token</span>
+        )}
+        <button
+          onClick={() => setRebuildConfirm(true)}
+          disabled={rebuildBusy}
+          className="action-secondary shrink-0"
+          title="按所选方式重建 wiki/index.md；log 缺失时自动回溯修复"
+        >
+          {rebuildBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          {rebuildBusy ? "重建中..." : "重建"}
+        </button>
+        {rebuildError && (
+          <span className="text-xs text-red-600">重建失败：{rebuildError}</span>
+        )}
+        {rebuildDone && (
+          <span className="text-xs text-emerald-700">
+            重建完成：{rebuildDone.page_count} 个页面{rebuildDone.log_rebuilt ? "，并已回溯修复日志" : ""}
+          </span>
+        )}
+      </div>
+
+      {/* 目录重建二次确认弹窗（锁定页面滚动） */}
+      {rebuildConfirm && (
+        <RebuildIndexConfirmDialog
+          mode={rebuildMode}
+          onClose={() => setRebuildConfirm(false)}
+          onConfirm={async () => {
+            setRebuildConfirm(false);
+            setRebuildBusy(true);
+            setRebuildError(null);
+            setRebuildDone(null);
+            try {
+              const res = await wikiApi.rebuildIndex(project.id, rebuildMode);
+              setRebuildDone(res);
+            } catch (e) {
+              setRebuildError(String(e));
+            } finally {
+              setRebuildBusy(false);
+            }
+          }}
+        />
       )}
 
       {/* Active ingest progress bars */}
