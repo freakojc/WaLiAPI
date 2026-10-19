@@ -4505,6 +4505,15 @@ function WikiProjectDetail({
 }) {
   const [initialSearchQuery, setInitialSearchQuery] = useState<string | null>(null);
 
+  // ── 目录重建（程序 / LLM）：工具栏置顶 sticky，仅「页面」tab 可见 ──
+  const [rebuildMode, setRebuildMode] = useState<"program" | "llm">("program");
+  const [rebuildConfirm, setRebuildConfirm] = useState(false);
+  const [rebuildBusy, setRebuildBusy] = useState(false);
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
+  const [rebuildDone, setRebuildDone] = useState<WikiIndexRebuildResult | null>(null);
+  // 页面列表搜索词（过滤标题/路径）
+  const [pageSearchQuery, setPageSearchQuery] = useState("");
+
   // 实时测量次级菜单行（Breadcrumb + Tabs）高度 → CSS 变量 --wali-tabs-h。
   // Wiki 页面详情里的"返回列表/编辑/删除"操作行 sticky top 用它做阈值（header + tabs 高度），
   // 保证操作行钉在 Tabs 正下方而不重叠（Tabs 高度随窗口宽度/换行变化）。
@@ -4595,13 +4604,84 @@ function WikiProjectDetail({
         </div>
       </div>
 
+      {/* 目录重建工具栏：仅在「页面」tab 显示；置顶 sticky，钉在 Breadcrumb + Tabs（设置按钮所在行）正下方，
+          不随页面滚动隐藏（log 缺失时一并回溯修复） */}
+      {tab === "pages" && (
+      <div className="sticky top-[calc(var(--wali-page-header-h,88px)+var(--wali-tabs-h,40px))] z-20 -mx-1 flex flex-wrap items-center gap-3 rounded-2xl border border-slate-100 bg-white/95 px-4 py-2.5 backdrop-blur">
+        <div className="flex items-center gap-2">
+          <ListTree className="h-4 w-4 text-slate-400" />
+          <span className="text-xs font-medium text-slate-700">重建目录</span>
+        </div>
+        <Select
+          value={rebuildMode}
+          onChange={(v) => { setRebuildMode(v as "program" | "llm"); setRebuildDone(null); setRebuildError(null); }}
+          size="sm"
+          ariaLabel="重建目录方式"
+          className="w-56 shrink-0"
+          options={[
+            { value: "program", label: "程序化（按类型分组，零消耗）" },
+            { value: "llm", label: "LLM 智能归组（消耗 token）" },
+          ]}
+        />
+        <button
+          onClick={() => setRebuildConfirm(true)}
+          disabled={rebuildBusy}
+          className="action-secondary shrink-0"
+          title="按所选方式重建 wiki/index.md；log 缺失时自动回溯修复"
+        >
+          {rebuildBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          {rebuildBusy ? "重建中..." : "重建"}
+        </button>
+        {rebuildError && (
+          <span className="text-xs text-red-600">重建失败：{rebuildError}</span>
+        )}
+        {rebuildDone && (
+          <span className="text-xs text-emerald-700">
+            重建完成：{rebuildDone.page_count} 个页面{rebuildDone.log_rebuilt ? "，并已回溯修复日志" : ""}
+          </span>
+        )}
+        {/* 搜索文档：过滤页面列表（标题/路径关键字） */}
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          <Search size={14} className="text-slate-400" />
+          <input
+            value={pageSearchQuery}
+            onChange={(e) => setPageSearchQuery(e.target.value)}
+            placeholder="搜索文档"
+            className="w-52 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-700 outline-none transition-all placeholder:text-slate-400 hover:border-blue-400 focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+          />
+        </div>
+      </div>
+      )}
+
       {/* Tab Content */}
       {tab === "overview" && <WikiOverview project={project} onTagClick={(tag) => { setInitialSearchQuery(tag); setTab("search"); }} />}
-      {tab === "pages" && <WikiPagesTab project={project} />}
+      {tab === "pages" && <WikiPagesTab project={project} searchQuery={pageSearchQuery} />}
       {tab === "sources" && <WikiSourcesTab project={project} onRefresh={onRefresh} onNavigateSettings={() => setTab("settings")} progressMap={wikiProgress} sourcesVersion={wikiSourcesVersion} />}
       {tab === "search" && <WikiSearchTab project={project} initialQuery={initialSearchQuery} onInitialQueryConsumed={() => setInitialSearchQuery(null)} />}
       {tab === "graph" && <WikiGraphTab project={project} />}
       {tab === "settings" && <WikiSettingsTab project={project} onUpdated={onUpdated} />}
+
+      {/* 目录重建二次确认弹窗（锁定页面滚动；LLM 消耗说明仅在弹窗内提示） */}
+      {rebuildConfirm && (
+        <RebuildIndexConfirmDialog
+          mode={rebuildMode}
+          onClose={() => setRebuildConfirm(false)}
+          onConfirm={async () => {
+            setRebuildConfirm(false);
+            setRebuildBusy(true);
+            setRebuildError(null);
+            setRebuildDone(null);
+            try {
+              const res = await wikiApi.rebuildIndex(project.id, rebuildMode);
+              setRebuildDone(res);
+            } catch (e) {
+              setRebuildError(String(e));
+            } finally {
+              setRebuildBusy(false);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -4743,7 +4823,7 @@ function WikiOverview({ project, onTagClick }: { project: WikiProject; onTagClic
   );
 }
 
-function WikiPagesTab({ project }: { project: WikiProject }) {
+function WikiPagesTab({ project, searchQuery }: { project: WikiProject; searchQuery: string }) {
   const [pages, setPages] = useState<WikiPage[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedPage, setSelectedPage] = useState<string | null>(null);
@@ -4752,6 +4832,23 @@ function WikiPagesTab({ project }: { project: WikiProject }) {
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [pageDeleteTarget, setPageDeleteTarget] = useState<string | null>(null);
+
+  // 列表 ↔ MD 详情的滚动位置管理（滚动容器为 Layout 的 [data-wali-scroll]）：
+  // 进入详情始终从顶部显示；返回列表恢复到点击时的位置，避免双向继承滚动位置。
+  const listScrollRef = useRef(0);
+  const needRestoreScrollRef = useRef(false);
+  const getScroller = () => document.querySelector<HTMLElement>("[data-wali-scroll]");
+
+  useEffect(() => {
+    const scroller = getScroller();
+    if (!scroller) return;
+    if (selectedPage) {
+      scroller.scrollTo({ top: 0 });
+    } else if (needRestoreScrollRef.current) {
+      needRestoreScrollRef.current = false;
+      scroller.scrollTo({ top: listScrollRef.current });
+    }
+  }, [selectedPage]);
 
   const fetchPages = useCallback(async () => {
     setLoading(true);
@@ -4762,12 +4859,18 @@ function WikiPagesTab({ project }: { project: WikiProject }) {
   useEffect(() => { fetchPages(); }, [fetchPages]);
 
   const openPage = async (path: string) => {
+    listScrollRef.current = getScroller()?.scrollTop ?? 0;
     setSelectedPage(path);
     setEditing(false);
     try {
       const page = await wikiApi.getPage(project.id, path);
       setPageContent(page.content || "");
     } catch { setPageContent("无法加载页面内容"); }
+  };
+
+  const backToList = () => {
+    needRestoreScrollRef.current = true;
+    setSelectedPage(null);
   };
 
   const doDeletePage = async (path: string) => {
@@ -4813,7 +4916,7 @@ function WikiPagesTab({ project }: { project: WikiProject }) {
         <div className="sticky top-[calc(var(--wali-page-header-h,88px)+var(--wali-tabs-h,40px))] z-20 -mx-1 flex items-center justify-between gap-3 rounded-2xl border border-slate-100 bg-white/95 px-4 py-2.5 backdrop-blur">
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <button
-              onClick={() => setSelectedPage(null)}
+              onClick={backToList}
               className="inline-flex shrink-0 items-center gap-1 text-xs text-slate-500 hover:text-slate-900"
             >
               <ChevronRight className="h-3 w-3 rotate-180" /> 返回列表
@@ -4874,10 +4977,16 @@ function WikiPagesTab({ project }: { project: WikiProject }) {
     log: "bg-slate-50 text-slate-500",
   };
 
+  // 按搜索词过滤（标题/路径包含匹配，大小写不敏感）
+  const q = searchQuery.trim().toLowerCase();
+  const visiblePages = q
+    ? pages.filter(p => p.title.toLowerCase().includes(q) || p.path.toLowerCase().includes(q))
+    : pages;
+
   return (
     <div className="surface rounded-2xl overflow-hidden">
       <div className="divide-y divide-slate-50">
-        {pages.map(p => (
+        {visiblePages.map(p => (
           <div key={p.id} className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50 cursor-pointer" onClick={() => openPage(p.path)}>
             <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${typeColors[p.page_type] || "bg-slate-50 text-slate-500"}`}>{p.page_type}</span>
             <div className="min-w-0 flex-1">
@@ -4888,6 +4997,11 @@ function WikiPagesTab({ project }: { project: WikiProject }) {
             <ChevronRight className="h-4 w-4 text-slate-300" />
           </div>
         ))}
+        {visiblePages.length === 0 && (
+          <div className="px-4 py-10 text-center text-sm text-slate-400">
+            {q ? `没有匹配「${searchQuery.trim()}」的页面` : "还没有 Wiki 页面"}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -4947,12 +5061,6 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings, progressMap, s
   const [uploadTotal, setUploadTotal] = useState(0);
   const [uploadingCount, setUploadingCount] = useState(0);
   const [sourceFileDeleteTarget, setSourceFileDeleteTarget] = useState<{ message: string; run: () => void } | null>(null);
-  // ── 目录重建（程序 / LLM）──
-  const [rebuildMode, setRebuildMode] = useState<"program" | "llm">("program");
-  const [rebuildConfirm, setRebuildConfirm] = useState(false);
-  const [rebuildBusy, setRebuildBusy] = useState(false);
-  const [rebuildError, setRebuildError] = useState<string | null>(null);
-  const [rebuildDone, setRebuildDone] = useState<WikiIndexRebuildResult | null>(null);
 
   const fetchSources = useCallback(async () => {
     setLoading(true);
@@ -5152,64 +5260,6 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings, progressMap, s
             </div>
           </div>
         </div>
-      )}
-
-      {/* 目录重建工具栏（程序化分组 / LLM 语义归组；log 缺失时一并回溯修复） */}
-      <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-100 bg-slate-50/70 px-4 py-3">
-        <div className="flex items-center gap-2">
-          <ListTree className="h-4 w-4 text-slate-400" />
-          <span className="text-xs font-medium text-slate-700">重建目录</span>
-        </div>
-        <select
-          value={rebuildMode}
-          onChange={(e) => { setRebuildMode(e.target.value as "program" | "llm"); setRebuildDone(null); setRebuildError(null); }}
-          className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-700"
-        >
-          <option value="program">程序化（按类型分组，零消耗）</option>
-          <option value="llm">LLM 智能归组（消耗 token）</option>
-        </select>
-        {rebuildMode === "llm" && (
-          <span className="text-[11px] text-amber-600">⚠ 将调用一次 LLM 对全部页面做语义归组，会消耗 token</span>
-        )}
-        <button
-          onClick={() => setRebuildConfirm(true)}
-          disabled={rebuildBusy}
-          className="action-secondary shrink-0"
-          title="按所选方式重建 wiki/index.md；log 缺失时自动回溯修复"
-        >
-          {rebuildBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-          {rebuildBusy ? "重建中..." : "重建"}
-        </button>
-        {rebuildError && (
-          <span className="text-xs text-red-600">重建失败：{rebuildError}</span>
-        )}
-        {rebuildDone && (
-          <span className="text-xs text-emerald-700">
-            重建完成：{rebuildDone.page_count} 个页面{rebuildDone.log_rebuilt ? "，并已回溯修复日志" : ""}
-          </span>
-        )}
-      </div>
-
-      {/* 目录重建二次确认弹窗（锁定页面滚动） */}
-      {rebuildConfirm && (
-        <RebuildIndexConfirmDialog
-          mode={rebuildMode}
-          onClose={() => setRebuildConfirm(false)}
-          onConfirm={async () => {
-            setRebuildConfirm(false);
-            setRebuildBusy(true);
-            setRebuildError(null);
-            setRebuildDone(null);
-            try {
-              const res = await wikiApi.rebuildIndex(project.id, rebuildMode);
-              setRebuildDone(res);
-            } catch (e) {
-              setRebuildError(String(e));
-            } finally {
-              setRebuildBusy(false);
-            }
-          }}
-        />
       )}
 
       {/* Active ingest progress bars */}
